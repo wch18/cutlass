@@ -171,6 +171,7 @@ foreach(EXAMPLE
   90_sm103_fp4_ultra_grouped_gemm
   91_fp4_gemv
   92_blackwell_moe_gemm
+  93_sm120_tensor_storage
   )
 
   add_subdirectory(${EXAMPLE})
