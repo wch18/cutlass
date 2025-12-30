@@ -375,6 +375,55 @@ for (int k_iter = 0; k_iter < kTileCount; ++k_iter) {
 }
 ```
 
+If you want to see the real thing, the SM90 warp-specialized GEMM producer warp acquires pipeline stages, issues TMA traffic, and advances the ring buffer exactly this way (omitting scheduling code for brevity):
+
+```cpp
+while (work_tile_info.is_valid()) {
+  // Producer warp preps the next stage
+  collective_mainloop.load(
+    params.mainloop,
+    mainloop_pipeline,
+    mainloop_pipe_producer_state,
+    load_inputs,
+    blk_coord,
+    k_tile_iter, k_tile_count,
+    lane_idx,
+    block_rank_in_cluster,
+    shared_storage.tensors.mainloop
+  );
+  // Update starting pipeline state for the next tile
+  mainloop_pipe_producer_state.advance(k_tile_count);
+}
+
+// Make sure all Consumer Warp Groups have been waited upon
+collective_mainloop.load_tail(mainloop_pipeline, mainloop_pipe_producer_state);
+```
+[Source: `include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp`](../include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp)
+
+On the consumer side, math warpgroups wait on the full barriers, perform MMA, and advance their pipeline state at the same cadence before handing off to the epilogue:
+
+```cpp
+collective_mainloop.mma(
+  mainloop_pipeline,
+  mainloop_pipe_consumer_state,
+  accumulators,
+  k_tile_count,
+  warp_group_thread_idx,
+  shared_storage.tensors.mainloop,
+  params.mainloop
+);
+
+// Make sure the math instructions are done and free buffers before entering the epilogue
+collective_mainloop.mma_tail(
+  mainloop_pipeline,
+  mainloop_pipe_consumer_state,
+  k_tile_count
+);
+// Update starting mainloop pipeline state for the next tile
+mainloop_pipe_consumer_state.advance(k_tile_count * NumMmaWarpGroups);
+```
+[Source: `include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp`](../include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp)
+
 All real SM90 mainloops in CUTLASS follow this shape—the differences are **who plays producer**, how many stages exist, and whether TMA or `cp.async` drives movement.
 
 ---
