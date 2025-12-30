@@ -460,6 +460,35 @@ graph LR
 
 Producer warps stay in the TMA-heavy code path; consumer warps stay in the MMA-heavy path, reducing divergence and keeping Tensor Cores saturated once the pipe is full.
 
+Those policy tags are not just comments—the kernel entry points specialize on them and derive warp counts, cluster shape, and pipeline storage accordingly. The SM90 TMA warp-specialized GEMM kernel, for example, only participates when the collective mainloop advertises the matching schedule tag and then pulls the cluster shape and pipeline storage layout directly from the dispatch policy:
+
+```cpp
+class GemmUniversal<
+  ProblemShape_,
+  CollectiveMainloop_,
+  CollectiveEpilogue_,
+  TileScheduler_,
+  cute::enable_if_t<cute::is_base_of_v<cutlass::gemm::KernelTmaWarpSpecialized, typename CollectiveMainloop_::DispatchPolicy::Schedule>>
+>
+{
+public:
+  using DispatchPolicy = typename CollectiveMainloop::DispatchPolicy;
+  using ClusterShape = typename DispatchPolicy::ClusterShape;
+
+  struct SharedStorage {
+    using MainloopPipelineStorage = typename CollectiveMainloop::PipelineStorage;
+    alignas(16) MainloopPipelineStorage mainloop;
+  };
+
+  static constexpr uint32_t NumLoadWarpGroups = 1;
+  static constexpr uint32_t NumMmaWarpGroups  = DispatchPolicy::NumMmaWarpGroups;
+  static constexpr uint32_t NumWarpGroups     = NumLoadWarpGroups + NumMmaWarpGroups;
+};
+```
+[Source: `include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized.hpp`](../include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized.hpp)
+
+The ping-pong and cooperative tags feed sibling kernel specializations that swap in two producer warps or cluster-cooperative roles, but the surrounding loop shapes and pipeline usage from sections 2–3 remain the same.
+
 ---
 
 ## 5) Understanding `Stages` and common patterns
