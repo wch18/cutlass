@@ -430,13 +430,33 @@ All real SM90 mainloops in CUTLASS follow this shape—the differences are **who
 
 ## 4) How warp specialization plugs in
 
-The dispatch policy chooses both **pipeline flavor** and **warp roles**. For GEMM, you will see tags in `cutlass/gemm/dispatch_policy.hpp`:
+The dispatch policy chooses both **pipeline flavor** and **warp roles**. For GEMM, those tags are plain structs in `cutlass/gemm/dispatch_policy.hpp`:
 
-* `KernelTmaWarpSpecialized` → one producer warp, multiple consumer warps.【F:include/cutlass/gemm/dispatch_policy.hpp†L70-L84】
-* `KernelTmaWarpSpecializedPingpong` → two producer warps that alternate by stage (ping-pong).【F:include/cutlass/gemm/dispatch_policy.hpp†L84-L96】
-* `KernelTmaWarpSpecializedCooperative` → producer duties are distributed across a cluster, letting several CTAs feed the same shared tiles.【F:include/cutlass/gemm/dispatch_policy.hpp†L96-L122】
+```cpp
+struct KernelTmaWarpSpecialized { };
 
-The convolution dispatcher (`cutlass/conv/dispatch_policy.hpp`) forwards similar tags for implicit GEMM conv kernels, so the same pipeline machinery is reused.【F:include/cutlass/conv/dispatch_policy.hpp†L47-L74】
+struct KernelTmaWarpSpecializedPingpong {
+  static constexpr int SchedulerPipelineStageCount = 0;
+};
+
+struct KernelTmaWarpSpecializedCooperative {
+  static constexpr int SchedulerPipelineStageCount = 0;
+};
+```
+[Source: `include/cutlass/gemm/dispatch_policy.hpp`](../include/cutlass/gemm/dispatch_policy.hpp)
+
+* `KernelTmaWarpSpecialized` → one producer warp, multiple consumer warps.
+* `KernelTmaWarpSpecializedPingpong` → two producer warps that alternate by stage (ping-pong).
+* `KernelTmaWarpSpecializedCooperative` → producer duties are distributed across a cluster, letting several CTAs feed the same shared tiles.
+
+The convolution dispatcher (`cutlass/conv/dispatch_policy.hpp`) forwards similar tags for implicit GEMM conv kernels, so the same pipeline machinery is reused:
+
+```cpp
+struct KernelImplicitTmaWarpSpecializedSm90 : cutlass::gemm::KernelTmaWarpSpecialized { };
+struct KernelImplicitTmaWarpSpecializedSm90Cooperative { };
+struct KernelImplicitTmaWarpSpecializedSm90Pingpong { };
+```
+[Source: `include/cutlass/conv/dispatch_policy.hpp`](../include/cutlass/conv/dispatch_policy.hpp)
 
 ### Visualizing warp-specialized flow (two-stage example)
 
