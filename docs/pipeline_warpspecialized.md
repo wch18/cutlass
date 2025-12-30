@@ -29,20 +29,320 @@ while (k_tiles_left) {
 ## 2) The core building blocks
 
 ### 2.1 `PipelineState`
-Tracks the circular stage index (`stage_idx`), a phase bit for barriers (`phase`), and a running iteration count. Advancing rolls over the stage and toggles phase so producer/consumer stay in sync across the ring buffer.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L230-L259】 Helper factories like `make_producer_start_state` set the producer one phase ahead so it can fill an empty pipe.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L252-L259】
+Tracks the circular stage index (`stage_idx`), a phase bit for barriers (`phase`), and a running iteration count. Advancing rolls over the stage and toggles phase so producer/consumer stay in sync across the ring buffer:
+
+```cpp
+CUTLASS_DEVICE
+PipelineState& advance(uint32_t num_iterations) {
+  if constexpr (Stages > 0) {
+    // Number of iterations cross over the stage boundary => flipped phase
+    if ((num_iterations < Stages) && (index_ + num_iterations) >= Stages ) {
+      phase_ ^= 1;
+    }
+    // How many times number of iterations cross over the stage boundary and
+    // end up on a odd number => flipped phase
+    if ((num_iterations >= Stages) && (((index_ + num_iterations) / Stages) % 2) == 1) {
+      phase_ ^= 1;
+    }
+    index_ = (index_ + num_iterations) % Stages;
+    count_ += num_iterations;
+  }
+  return *this;
+}
+
+template<class Pipeline>
+CUTLASS_DEVICE
+PipelineState<Pipeline::Stages> make_producer_start_state() {
+  // Producer starts with an opposite phase as the buffers are initially empty
+  constexpr int InitialProducerStage = 0;
+  constexpr uint32_t InitialProducerPhase = 1;
+  constexpr uint32_t InitialProducerCount = 0;
+  return {InitialProducerStage, InitialProducerPhase, InitialProducerCount};
+}
+```
+[Source: `include/cutlass/pipeline/sm90_pipeline.hpp`](../include/cutlass/pipeline/sm90_pipeline.hpp)
 
 ### 2.2 Barrier-backed TMA pipeline (`PipelineTmaAsync`)
 Used by SM90 GEMM/conv mainloops that move tiles with TMA:
 
-* **Barriers:** Paired arrays `full_barrier_` (consumer waits) and `empty_barrier_` (producer waits) live in SMEM. Initialization seeds arrival counts for every stage and, on clusters, distributes which threads signal each destination block to reduce contention.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L271-L376】
-* **Producer path:** `producer_try_acquire`/`producer_acquire` wait on `empty_barrier_` for a free slot; the leader thread issues `tma::expect` and `tma::commit` (or `producer_commit`), then advances the pipeline state.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L530-L642】
-* **Consumer path:** `consumer_wait` waits on `full_barrier_`, does MMA on the tile for that stage, then `consumer_release` arrives on `empty_barrier_` so the producer can reuse it.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L530-L642】
+* **Barriers:** Paired arrays `full_barrier_` (consumer waits) and `empty_barrier_` (producer waits) live in SMEM. Initialization seeds arrival counts for every stage and, on clusters, distributes which threads signal each destination block to reduce contention:
+
+  ```cpp
+  struct SharedStorage {
+    FullBarrier full_barrier_[Stages];
+    EmptyBarrier empty_barrier_[Stages];
+  };
+
+  template <class ClusterShape>
+  CUTLASS_DEVICE
+  static void init_barriers(SharedStorage& storage, Params params, ClusterShape cluster_shape) {
+    int warp_idx = canonical_warp_idx_sync();
+    bool is_initializing_warp = (warp_idx == 0);
+    is_initializing_warp = (warp_idx == params.initializing_warp);
+    if (is_initializing_warp) {
+      uint32_t const producer_arv_cnt = params.num_producers;
+      uint32_t const num_consumer_warpgroups_per_cluster = cute::ceil_div(params.num_consumers, static_cast<uint32_t>(NumThreadsPerWarpGroup));
+      uint32_t multicast_consumer_arrival_count = params.num_consumers; // If cluster_size is 1
+      if (cute::size(cluster_shape) > 1) {
+        multicast_consumer_arrival_count = (cute::size<0>(cluster_shape) + cute::size<1>(cluster_shape) - 1) *
+              num_consumer_warpgroups_per_cluster;
+      }
+      cutlass::arch::detail::initialize_barrier_array_pair_aligned<decltype(storage.full_barrier_), decltype(storage.empty_barrier_), Stages>(
+          storage.full_barrier_, storage.empty_barrier_, producer_arv_cnt, multicast_consumer_arrival_count);
+    }
+    cutlass::arch::fence_barrier_init();
+  }
+  ```
+  [Source: `include/cutlass/pipeline/sm90_pipeline.hpp`](../include/cutlass/pipeline/sm90_pipeline.hpp)
+
+* **Producer path:** `producer_try_acquire`/`producer_acquire` wait on `empty_barrier_` for a free slot; the leader thread issues `tma::expect` and `tma::commit` (or `producer_commit`), then advances the pipeline state:
+
+  ```cpp
+  CUTLASS_DEVICE
+  ProducerToken producer_try_acquire(uint32_t stage, uint32_t phase, uint32_t skip_wait) {
+    detail::pipeline_check_is_producer(params_.role);
+    if (skip_wait) {
+      return {BarrierStatus::WaitDone};
+    }
+    bool barrier_status = empty_barrier_ptr_[stage].try_wait(phase);
+    return {static_cast<BarrierStatus>(barrier_status)};
+  }
+
+  CUTLASS_DEVICE
+  void producer_acquire(uint32_t stage, uint32_t phase, ProducerToken barrier_token) {
+    detail::pipeline_check_is_producer(params_.role);
+    if (barrier_token != BarrierStatus::WaitDone) {
+      empty_barrier_ptr_[stage].wait(phase);
+    }
+    if (params_.is_leader) {
+      full_barrier_ptr_[stage].arrive_and_expect_tx(params_.transaction_bytes);
+    }
+  }
+  ```
+  [Source: `include/cutlass/pipeline/sm90_pipeline.hpp`](../include/cutlass/pipeline/sm90_pipeline.hpp)
+
+* **Consumer path:** `consumer_wait` waits on `full_barrier_`, does MMA on the tile for that stage, then `consumer_release` arrives on `empty_barrier_` so the producer can reuse it:
+
+  ```cpp
+  CUTLASS_DEVICE
+  void consumer_wait(uint32_t stage, uint32_t phase, ConsumerToken barrier_token) {
+    detail::pipeline_check_is_consumer(params_.role);
+    if (barrier_token == BarrierStatus::WaitAgain) {
+      full_barrier_ptr_[stage].wait(phase);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void consumer_release(uint32_t stage, uint32_t skip = false) {
+    detail::pipeline_check_is_consumer(params_.role);
+    empty_barrier_ptr_[stage].arrive(dst_blockid_, is_signaling_thread_ & (!skip));
+  }
+  ```
+  [Source: `include/cutlass/pipeline/sm90_pipeline.hpp`](../include/cutlass/pipeline/sm90_pipeline.hpp)
 
 ### 2.3 Store pipeline (`PipelineTmaStore`)
-Mirrors the TMA load pipeline for epilogues, letting you throttle how many store batches are in flight (`UnacquiredStages`) before blocking, which overlaps writeback with math.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L646-L708】
+Mirrors the TMA load pipeline for epilogues, letting you throttle how many store batches are in flight (`UnacquiredStages`) before blocking, which overlaps writeback with math:
+
+```cpp
+template <int Stages_, int UnacquiredStages_ = Stages_-1>
+class PipelineTmaStore {
+public:
+  static constexpr uint32_t Stages = Stages_;
+  static constexpr uint32_t UnacquiredStages = static_cast<uint32_t>(UnacquiredStages_);
+  using PipelineState = cutlass::PipelineState<Stages>;
+
+  struct Params { bool always_wait = false; };
+
+  CUTLASS_DEVICE
+  void producer_acquire(PipelineState state) { producer_acquire(state.index(), state.count()); }
+
+  CUTLASS_DEVICE
+  void producer_commit(PipelineState state) { producer_commit(state.index(), state.count()); }
+
+  CUTLASS_DEVICE
+  void producer_tail([[maybe_unused]] PipelineState state) { tma_store_wait<0>(); }
+
+private:
+  Params params_;
+  CUTLASS_DEVICE
+  void producer_acquire([[maybe_unused]] uint32_t stage, uint32_t count) {
+    if (params_.always_wait || count > UnacquiredStages) { tma_store_wait<UnacquiredStages>(); }
+  }
+
+  CUTLASS_DEVICE
+  void producer_commit([[maybe_unused]] uint32_t stage, [[maybe_unused]] uint32_t count) {
+    tma_store_arrive();
+  }
+};
+```
+[Source: `include/cutlass/pipeline/sm90_pipeline.hpp`](../include/cutlass/pipeline/sm90_pipeline.hpp)
 
 ### 2.4 Lightweight async pipeline (`PipelineAsync`)
-For kernels using `cp.async` or non-TMA traffic, `PipelineAsync` provides the same acquire/commit/wait/release choreography on plain cluster barriers, parameterized by producer/consumer roles.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L1040-L1234】
+For kernels using `cp.async` or non-TMA traffic, `PipelineAsync` provides the same acquire/commit/wait/release choreography on plain cluster barriers, parameterized by producer/consumer roles. The class mirrors the TMA helpers but with a simpler initialization:
+
+```cpp
+template <int Stages_>
+class PipelineAsync {
+public:
+  struct SharedStorage {
+    FullBarrier full_barrier_[Stages];
+    EmptyBarrier empty_barrier_[Stages];
+  };
+
+  static CUTLASS_DEVICE void init_barriers(SharedStorage& storage, Params params) {
+    int warp_idx = canonical_warp_idx_sync();
+    bool is_initializing_warp = (warp_idx == params.initializing_warp);
+    if (is_initializing_warp) {
+      cutlass::arch::detail::initialize_barrier_array_pair_aligned<decltype(storage.full_barrier_), decltype(storage.empty_barrier_), Stages>(
+          storage.full_barrier_, storage.empty_barrier_, params.producer_arv_count, params.consumer_arv_count);
+    }
+    cutlass::arch::fence_barrier_init();
+  }
+```
+[Source: `include/cutlass/pipeline/sm90_pipeline.hpp`](../include/cutlass/pipeline/sm90_pipeline.hpp)
+
+It exposes the same wrapper helpers as the TMA version (forwarding to the private implementations below) and adds a `producer_tail` guard so producer blocks in a cluster don’t exit early while others still depend on them:
+
+```cpp
+  CUTLASS_DEVICE
+  ProducerToken producer_try_acquire(PipelineState state, uint32_t skip_wait = false) {
+    return producer_try_acquire(state.index(), state.phase(), skip_wait);
+  }
+
+  CUTLASS_DEVICE
+  void producer_acquire(PipelineState state, ProducerToken barrier_token = {BarrierStatus::WaitAgain}) {
+    producer_acquire(state.index(), state.phase(), barrier_token);
+  }
+
+  CUTLASS_DEVICE
+  void producer_commit(PipelineState state) {
+    producer_commit(state.index());
+  }
+
+  template<class UserDefinedArriveOp>
+  CUTLASS_DEVICE
+  void producer_commit(PipelineState state, UserDefinedArriveOp&& user_defined_arrive_op) {
+    cute::forward<UserDefinedArriveOp>(user_defined_arrive_op)(producer_get_barrier(state.index()));
+    producer_commit(state);
+  }
+
+  // Prevents early exit of producer blocks in Cluster.
+  // This should be called once before kernel exits.
+  CUTLASS_DEVICE
+  void producer_tail(PipelineState state) {
+    for (int count = 0; count < Stages; ++count) {
+      producer_acquire(state);
+      ++state;
+    }
+  }
+
+  CUTLASS_DEVICE
+  ProducerBarrierType* producer_get_barrier(PipelineState state) {
+    return producer_get_barrier(state.index());
+  }
+
+  ////////////////////
+  // Consumer APIs
+  ////////////////////
+  CUTLASS_DEVICE
+  ConsumerToken consumer_try_wait(PipelineState state, uint32_t skip_wait = false) {
+    return consumer_try_wait(state.index(), state.phase(), skip_wait);
+  }
+
+  CUTLASS_DEVICE
+  ConsumerToken consumer_test_wait(PipelineState state, uint32_t skip_wait = false) {
+    return consumer_test_wait(state.index(), state.phase(), skip_wait);
+  }
+
+  CUTLASS_DEVICE
+  void consumer_wait(PipelineState state, ConsumerToken barrier_token = {BarrierStatus::WaitAgain}) {
+    consumer_wait(state.index(), state.phase(), barrier_token);
+  }
+
+  CUTLASS_DEVICE
+  void consumer_release(PipelineState state) {
+    consumer_release(state.index());
+  }
+
+  CUTLASS_DEVICE
+  ProducerBarrierType* producer_get_barrier(uint32_t stage) {
+    return reinterpret_cast<ProducerBarrierType*>(&full_barrier_ptr_[stage]);
+  }
+```
+[Source: `include/cutlass/pipeline/sm90_pipeline.hpp`](../include/cutlass/pipeline/sm90_pipeline.hpp)
+
+The private implementations mirror the TMA pipeline but without TMA-specific arrive/expect calls—producers and consumers simply wait on the appropriate barrier, then arrive to flip it for the opposite side:
+
+```cpp
+  CUTLASS_DEVICE
+  ProducerToken producer_try_acquire(uint32_t stage, uint32_t phase, uint32_t skip_wait) {
+    detail::pipeline_check_is_producer(params_.role);
+    if (skip_wait) {
+      return {BarrierStatus::WaitDone};
+    }
+    bool barrier_status = empty_barrier_ptr_[stage].try_wait(phase);
+    return {static_cast<BarrierStatus>(barrier_status)};
+  }
+
+  CUTLASS_DEVICE
+  void producer_acquire(uint32_t stage, uint32_t phase, ProducerToken barrier_token) {
+    detail::pipeline_check_is_producer(params_.role);
+    if (barrier_token == BarrierStatus::WaitAgain) {
+      empty_barrier_ptr_[stage].wait(phase);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void producer_commit(uint32_t stage) {
+    detail::pipeline_check_is_producer(params_.role);
+    full_barrier_ptr_[stage].arrive();
+  }
+
+  CUTLASS_DEVICE
+  ConsumerToken consumer_try_wait(uint32_t stage, uint32_t phase, uint32_t skip_wait) {
+    detail::pipeline_check_is_consumer(params_.role);
+    if (skip_wait) {
+      return {BarrierStatus::WaitDone};
+    }
+    bool barrier_status = full_barrier_ptr_[stage].try_wait(phase);
+    return {static_cast<BarrierStatus>(barrier_status)};
+  }
+
+  CUTLASS_DEVICE
+  ConsumerToken consumer_test_wait(uint32_t stage, uint32_t phase, uint32_t skip_wait) {
+    detail::pipeline_check_is_consumer(params_.role);
+    if (skip_wait) {
+      return {BarrierStatus::WaitDone};
+    }
+    bool barrier_status = full_barrier_ptr_[stage].test_wait(phase);
+    return {static_cast<BarrierStatus>(barrier_status)};
+  }
+
+  CUTLASS_DEVICE
+  void consumer_wait(uint32_t stage, uint32_t phase) {
+    detail::pipeline_check_is_consumer(params_.role);
+    bool done = full_barrier_ptr_[stage].test_wait(phase);
+    if (!done) {
+      full_barrier_ptr_[stage].wait(phase);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void consumer_wait(uint32_t stage, uint32_t phase, ConsumerToken barrier_token) {
+    detail::pipeline_check_is_consumer(params_.role);
+    if (barrier_token == BarrierStatus::WaitAgain) {
+      full_barrier_ptr_[stage].wait(phase);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void consumer_release(uint32_t stage) {
+    detail::pipeline_check_is_consumer(params_.role);
+    empty_barrier_ptr_[stage].arrive(params_.dst_blockid);
+  }
+};
+```
+[Source: `include/cutlass/pipeline/sm90_pipeline.hpp`](../include/cutlass/pipeline/sm90_pipeline.hpp)
 
 ---
 
@@ -75,19 +375,88 @@ for (int k_iter = 0; k_iter < kTileCount; ++k_iter) {
 }
 ```
 
+If you want to see the real thing, the SM90 warp-specialized GEMM producer warp acquires pipeline stages, issues TMA traffic, and advances the ring buffer exactly this way (omitting scheduling code for brevity):
+
+```cpp
+while (work_tile_info.is_valid()) {
+  // Producer warp preps the next stage
+  collective_mainloop.load(
+    params.mainloop,
+    mainloop_pipeline,
+    mainloop_pipe_producer_state,
+    load_inputs,
+    blk_coord,
+    k_tile_iter, k_tile_count,
+    lane_idx,
+    block_rank_in_cluster,
+    shared_storage.tensors.mainloop
+  );
+  // Update starting pipeline state for the next tile
+  mainloop_pipe_producer_state.advance(k_tile_count);
+}
+
+// Make sure all Consumer Warp Groups have been waited upon
+collective_mainloop.load_tail(mainloop_pipeline, mainloop_pipe_producer_state);
+```
+[Source: `include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp`](../include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp)
+
+On the consumer side, math warpgroups wait on the full barriers, perform MMA, and advance their pipeline state at the same cadence before handing off to the epilogue:
+
+```cpp
+collective_mainloop.mma(
+  mainloop_pipeline,
+  mainloop_pipe_consumer_state,
+  accumulators,
+  k_tile_count,
+  warp_group_thread_idx,
+  shared_storage.tensors.mainloop,
+  params.mainloop
+);
+
+// Make sure the math instructions are done and free buffers before entering the epilogue
+collective_mainloop.mma_tail(
+  mainloop_pipeline,
+  mainloop_pipe_consumer_state,
+  k_tile_count
+);
+// Update starting mainloop pipeline state for the next tile
+mainloop_pipe_consumer_state.advance(k_tile_count * NumMmaWarpGroups);
+```
+[Source: `include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp`](../include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp)
+
 All real SM90 mainloops in CUTLASS follow this shape—the differences are **who plays producer**, how many stages exist, and whether TMA or `cp.async` drives movement.
 
 ---
 
 ## 4) How warp specialization plugs in
 
-The dispatch policy chooses both **pipeline flavor** and **warp roles**. For GEMM, you will see tags in `cutlass/gemm/dispatch_policy.hpp`:
+The dispatch policy chooses both **pipeline flavor** and **warp roles**. For GEMM, those tags are plain structs in `cutlass/gemm/dispatch_policy.hpp`:
 
-* `KernelTmaWarpSpecialized` → one producer warp, multiple consumer warps.【F:include/cutlass/gemm/dispatch_policy.hpp†L70-L84】
-* `KernelTmaWarpSpecializedPingpong` → two producer warps that alternate by stage (ping-pong).【F:include/cutlass/gemm/dispatch_policy.hpp†L84-L96】
-* `KernelTmaWarpSpecializedCooperative` → producer duties are distributed across a cluster, letting several CTAs feed the same shared tiles.【F:include/cutlass/gemm/dispatch_policy.hpp†L96-L122】
+```cpp
+struct KernelTmaWarpSpecialized { };
 
-The convolution dispatcher (`cutlass/conv/dispatch_policy.hpp`) forwards similar tags for implicit GEMM conv kernels, so the same pipeline machinery is reused.【F:include/cutlass/conv/dispatch_policy.hpp†L47-L74】
+struct KernelTmaWarpSpecializedPingpong {
+  static constexpr int SchedulerPipelineStageCount = 0;
+};
+
+struct KernelTmaWarpSpecializedCooperative {
+  static constexpr int SchedulerPipelineStageCount = 0;
+};
+```
+[Source: `include/cutlass/gemm/dispatch_policy.hpp`](../include/cutlass/gemm/dispatch_policy.hpp)
+
+* `KernelTmaWarpSpecialized` → one producer warp, multiple consumer warps.
+* `KernelTmaWarpSpecializedPingpong` → two producer warps that alternate by stage (ping-pong).
+* `KernelTmaWarpSpecializedCooperative` → producer duties are distributed across a cluster, letting several CTAs feed the same shared tiles.
+
+The convolution dispatcher (`cutlass/conv/dispatch_policy.hpp`) forwards similar tags for implicit GEMM conv kernels, so the same pipeline machinery is reused:
+
+```cpp
+struct KernelImplicitTmaWarpSpecializedSm90 : cutlass::gemm::KernelTmaWarpSpecialized { };
+struct KernelImplicitTmaWarpSpecializedSm90Cooperative { };
+struct KernelImplicitTmaWarpSpecializedSm90Pingpong { };
+```
+[Source: `include/cutlass/conv/dispatch_policy.hpp`](../include/cutlass/conv/dispatch_policy.hpp)
 
 ### Visualizing warp-specialized flow (two-stage example)
 
@@ -111,6 +480,35 @@ graph LR
 
 Producer warps stay in the TMA-heavy code path; consumer warps stay in the MMA-heavy path, reducing divergence and keeping Tensor Cores saturated once the pipe is full.
 
+Those policy tags are not just comments—the kernel entry points specialize on them and derive warp counts, cluster shape, and pipeline storage accordingly. The SM90 TMA warp-specialized GEMM kernel, for example, only participates when the collective mainloop advertises the matching schedule tag and then pulls the cluster shape and pipeline storage layout directly from the dispatch policy:
+
+```cpp
+class GemmUniversal<
+  ProblemShape_,
+  CollectiveMainloop_,
+  CollectiveEpilogue_,
+  TileScheduler_,
+  cute::enable_if_t<cute::is_base_of_v<cutlass::gemm::KernelTmaWarpSpecialized, typename CollectiveMainloop_::DispatchPolicy::Schedule>>
+>
+{
+public:
+  using DispatchPolicy = typename CollectiveMainloop::DispatchPolicy;
+  using ClusterShape = typename DispatchPolicy::ClusterShape;
+
+  struct SharedStorage {
+    using MainloopPipelineStorage = typename CollectiveMainloop::PipelineStorage;
+    alignas(16) MainloopPipelineStorage mainloop;
+  };
+
+  static constexpr uint32_t NumLoadWarpGroups = 1;
+  static constexpr uint32_t NumMmaWarpGroups  = DispatchPolicy::NumMmaWarpGroups;
+  static constexpr uint32_t NumWarpGroups     = NumLoadWarpGroups + NumMmaWarpGroups;
+};
+```
+[Source: `include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized.hpp`](../include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized.hpp)
+
+The ping-pong and cooperative tags feed sibling kernel specializations that swap in two producer warps or cluster-cooperative roles, but the surrounding loop shapes and pipeline usage from sections 2–3 remain the same.
+
 ---
 
 ## 5) Understanding `Stages` and common patterns
@@ -127,10 +525,62 @@ Producer warps stay in the TMA-heavy code path; consumer warps stay in the MMA-h
 
 ## 6) What latency is being hidden?
 
-* **Global → shared transfer time** – `producer_acquire` waits for an empty slot; once TMA is in flight, the consumer keeps using older stages until the full barrier flips, masking the transfer.
-* **Tensor Core issue latency** – deeper `Stages` keep a backlog of ready tiles so the consumer warp never bubbles waiting for data.
-* **Shared-memory bank conflicts / barrier overhead** – distributing signaling threads and per-stage barriers reduces hot spots when multiple CTAs participate, masking some synchronization delay.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L343-L376】
-* **Global store completion** – store pipelines allow several write batches to proceed before blocking, overlapping writeback with ongoing math.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L646-L708】
+Each pipeline stage overlaps a different slice of the memory/compute timeline. The bullets below call out which helpers do the masking and include small timelines so you can visualize why bubbles disappear once the pipe fills.
+
+* **Global → shared transfer time** – `producer_acquire` waits for an empty slot; once `tma::commit` fires, consumer warps keep using older stages until the matching full barrier flips, so TMA latency is hidden behind ongoing MMA.
+
+  ```mermaid
+  gantt
+    dateFormat  X
+    axisFormat  %s
+    section Producer
+    Acquire stage0   :a1, 0, 1
+    TMA stage0       :a2, 1, 3
+    Acquire stage1   :a3, 3, 1
+    TMA stage1       :a4, 4, 3
+    section Consumer
+    Wait full0       :c1, 1, 0.5
+    MMA on stage0    :c2, 1.5, 2.5
+    Wait full1       :c3, 4, 0.5
+    MMA on stage1    :c4, 4.5, 2.5
+  ```
+
+  When the first stage is pending (`TMA stage0`), consumers are busy on the previous tile (`MMA on stage0`). Only when both complete does everyone advance. This behavior comes directly from `consumer_wait`/`consumer_release` pairing on the per-stage barrier arrays.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L590-L636】
+
+* **Tensor Core issue latency** – deeper `Stages` keep a backlog of ready tiles so consumers rarely stall. After each MMA slice, `PipelineState::advance` rotates to the next stage and toggles the phase bit so the same barriers can be reused while the producer stays one (or more) tiles ahead.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L168-L260】
+
+* **Shared-memory bank conflicts / barrier overhead** – on clustered kernels, the constructor spreads which threads signal each destination block so arrivals are sharded across the warp-group instead of piling onto one lane. The per-stage barrier arrays also avoid global contention when several CTAs share a tile.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L343-L376】
+
+  ```mermaid
+  graph LR
+    subgraph Cluster arrivals
+      T0[Warp 0 lane 0] -->|arrive dst0| B0[Empty barrier stage s]
+      T1[Warp 1 lane 5] -->|arrive dst1| B0
+      T2[Warp 2 lane 17] -->|arrive dst2| B0
+    end
+    B0 -->|flip full barrier| Consumers
+  ```
+
+  Distributing arrivals like this masks the per-barrier latency spikes you would otherwise see when multiple CTAs multicast the same tile.
+
+* **Global store completion** – the `PipelineTmaStore` producer only blocks when more than `UnacquiredStages` store batches are in flight (or when `always_wait` is set). That means writeback can trail the mainloop by several stages before the producer thread waits, overlapping stores with MMA/epilogue math.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L646-L708】
+
+  ```mermaid
+  gantt
+    dateFormat  X
+    axisFormat  %s
+    section Epilogue warp
+    Issue store batch0    :s1, 0, 1
+    Issue store batch1    :s2, 1, 1
+    Issue store batch2    :s3, 2, 1
+    Wait (acquire)        :s4, 3, 0.5
+    section TMA unit
+    Commit batch0         :t1, 0, 2
+    Commit batch1         :t2, 1, 2
+    Commit batch2         :t3, 2, 2
+  ```
+
+  Only after `UnacquiredStages` batches are outstanding does `producer_acquire` force a wait, letting store hardware drain while the warp continues epilogue math on other tiles.
 
 ---
 
