@@ -525,10 +525,62 @@ The ping-pong and cooperative tags feed sibling kernel specializations that swap
 
 ## 6) What latency is being hidden?
 
-* **Global → shared transfer time** – `producer_acquire` waits for an empty slot; once TMA is in flight, the consumer keeps using older stages until the full barrier flips, masking the transfer.
-* **Tensor Core issue latency** – deeper `Stages` keep a backlog of ready tiles so the consumer warp never bubbles waiting for data.
-* **Shared-memory bank conflicts / barrier overhead** – distributing signaling threads and per-stage barriers reduces hot spots when multiple CTAs participate, masking some synchronization delay.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L343-L376】
-* **Global store completion** – store pipelines allow several write batches to proceed before blocking, overlapping writeback with ongoing math.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L646-L708】
+Each pipeline stage overlaps a different slice of the memory/compute timeline. The bullets below call out which helpers do the masking and include small timelines so you can visualize why bubbles disappear once the pipe fills.
+
+* **Global → shared transfer time** – `producer_acquire` waits for an empty slot; once `tma::commit` fires, consumer warps keep using older stages until the matching full barrier flips, so TMA latency is hidden behind ongoing MMA.
+
+  ```mermaid
+  gantt
+    dateFormat  X
+    axisFormat  %s
+    section Producer
+    Acquire stage0   :a1, 0, 1
+    TMA stage0       :a2, 1, 3
+    Acquire stage1   :a3, 3, 1
+    TMA stage1       :a4, 4, 3
+    section Consumer
+    Wait full0       :c1, 1, 0.5
+    MMA on stage0    :c2, 1.5, 2.5
+    Wait full1       :c3, 4, 0.5
+    MMA on stage1    :c4, 4.5, 2.5
+  ```
+
+  When the first stage is pending (`TMA stage0`), consumers are busy on the previous tile (`MMA on stage0`). Only when both complete does everyone advance. This behavior comes directly from `consumer_wait`/`consumer_release` pairing on the per-stage barrier arrays.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L590-L636】
+
+* **Tensor Core issue latency** – deeper `Stages` keep a backlog of ready tiles so consumers rarely stall. After each MMA slice, `PipelineState::advance` rotates to the next stage and toggles the phase bit so the same barriers can be reused while the producer stays one (or more) tiles ahead.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L168-L260】
+
+* **Shared-memory bank conflicts / barrier overhead** – on clustered kernels, the constructor spreads which threads signal each destination block so arrivals are sharded across the warp-group instead of piling onto one lane. The per-stage barrier arrays also avoid global contention when several CTAs share a tile.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L343-L376】
+
+  ```mermaid
+  graph LR
+    subgraph Cluster arrivals
+      T0[Warp 0 lane 0] -->|arrive dst0| B0[Empty barrier stage s]
+      T1[Warp 1 lane 5] -->|arrive dst1| B0
+      T2[Warp 2 lane 17] -->|arrive dst2| B0
+    end
+    B0 -->|flip full barrier| Consumers
+  ```
+
+  Distributing arrivals like this masks the per-barrier latency spikes you would otherwise see when multiple CTAs multicast the same tile.
+
+* **Global store completion** – the `PipelineTmaStore` producer only blocks when more than `UnacquiredStages` store batches are in flight (or when `always_wait` is set). That means writeback can trail the mainloop by several stages before the producer thread waits, overlapping stores with MMA/epilogue math.【F:include/cutlass/pipeline/sm90_pipeline.hpp†L646-L708】
+
+  ```mermaid
+  gantt
+    dateFormat  X
+    axisFormat  %s
+    section Epilogue warp
+    Issue store batch0    :s1, 0, 1
+    Issue store batch1    :s2, 1, 1
+    Issue store batch2    :s3, 2, 1
+    Wait (acquire)        :s4, 3, 0.5
+    section TMA unit
+    Commit batch0         :t1, 0, 2
+    Commit batch1         :t2, 1, 2
+    Commit batch2         :t3, 2, 2
+  ```
+
+  Only after `UnacquiredStages` batches are outstanding does `producer_acquire` force a wait, letting store hardware drain while the warp continues epilogue math on other tiles.
 
 ---
 
