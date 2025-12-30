@@ -198,21 +198,148 @@ public:
     }
     cutlass::arch::fence_barrier_init();
   }
+```
+[Source: `include/cutlass/pipeline/sm90_pipeline.hpp`](../include/cutlass/pipeline/sm90_pipeline.hpp)
 
+It exposes the same wrapper helpers as the TMA version (forwarding to the private implementations below) and adds a `producer_tail` guard so producer blocks in a cluster don’t exit early while others still depend on them:
+
+```cpp
   CUTLASS_DEVICE
   ProducerToken producer_try_acquire(PipelineState state, uint32_t skip_wait = false) {
     return producer_try_acquire(state.index(), state.phase(), skip_wait);
   }
+
   CUTLASS_DEVICE
   void producer_acquire(PipelineState state, ProducerToken barrier_token = {BarrierStatus::WaitAgain}) {
     producer_acquire(state.index(), state.phase(), barrier_token);
   }
+
+  CUTLASS_DEVICE
+  void producer_commit(PipelineState state) {
+    producer_commit(state.index());
+  }
+
+  template<class UserDefinedArriveOp>
+  CUTLASS_DEVICE
+  void producer_commit(PipelineState state, UserDefinedArriveOp&& user_defined_arrive_op) {
+    cute::forward<UserDefinedArriveOp>(user_defined_arrive_op)(producer_get_barrier(state.index()));
+    producer_commit(state);
+  }
+
+  // Prevents early exit of producer blocks in Cluster.
+  // This should be called once before kernel exits.
+  CUTLASS_DEVICE
+  void producer_tail(PipelineState state) {
+    for (int count = 0; count < Stages; ++count) {
+      producer_acquire(state);
+      ++state;
+    }
+  }
+
+  CUTLASS_DEVICE
+  ProducerBarrierType* producer_get_barrier(PipelineState state) {
+    return producer_get_barrier(state.index());
+  }
+
+  ////////////////////
+  // Consumer APIs
+  ////////////////////
+  CUTLASS_DEVICE
+  ConsumerToken consumer_try_wait(PipelineState state, uint32_t skip_wait = false) {
+    return consumer_try_wait(state.index(), state.phase(), skip_wait);
+  }
+
+  CUTLASS_DEVICE
+  ConsumerToken consumer_test_wait(PipelineState state, uint32_t skip_wait = false) {
+    return consumer_test_wait(state.index(), state.phase(), skip_wait);
+  }
+
   CUTLASS_DEVICE
   void consumer_wait(PipelineState state, ConsumerToken barrier_token = {BarrierStatus::WaitAgain}) {
     consumer_wait(state.index(), state.phase(), barrier_token);
   }
+
   CUTLASS_DEVICE
-  void consumer_release(PipelineState state) { consumer_release(state.index()); }
+  void consumer_release(PipelineState state) {
+    consumer_release(state.index());
+  }
+
+  CUTLASS_DEVICE
+  ProducerBarrierType* producer_get_barrier(uint32_t stage) {
+    return reinterpret_cast<ProducerBarrierType*>(&full_barrier_ptr_[stage]);
+  }
+```
+[Source: `include/cutlass/pipeline/sm90_pipeline.hpp`](../include/cutlass/pipeline/sm90_pipeline.hpp)
+
+The private implementations mirror the TMA pipeline but without TMA-specific arrive/expect calls—producers and consumers simply wait on the appropriate barrier, then arrive to flip it for the opposite side:
+
+```cpp
+  CUTLASS_DEVICE
+  ProducerToken producer_try_acquire(uint32_t stage, uint32_t phase, uint32_t skip_wait) {
+    detail::pipeline_check_is_producer(params_.role);
+    if (skip_wait) {
+      return {BarrierStatus::WaitDone};
+    }
+    bool barrier_status = empty_barrier_ptr_[stage].try_wait(phase);
+    return {static_cast<BarrierStatus>(barrier_status)};
+  }
+
+  CUTLASS_DEVICE
+  void producer_acquire(uint32_t stage, uint32_t phase, ProducerToken barrier_token) {
+    detail::pipeline_check_is_producer(params_.role);
+    if (barrier_token == BarrierStatus::WaitAgain) {
+      empty_barrier_ptr_[stage].wait(phase);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void producer_commit(uint32_t stage) {
+    detail::pipeline_check_is_producer(params_.role);
+    full_barrier_ptr_[stage].arrive();
+  }
+
+  CUTLASS_DEVICE
+  ConsumerToken consumer_try_wait(uint32_t stage, uint32_t phase, uint32_t skip_wait) {
+    detail::pipeline_check_is_consumer(params_.role);
+    if (skip_wait) {
+      return {BarrierStatus::WaitDone};
+    }
+    bool barrier_status = full_barrier_ptr_[stage].try_wait(phase);
+    return {static_cast<BarrierStatus>(barrier_status)};
+  }
+
+  CUTLASS_DEVICE
+  ConsumerToken consumer_test_wait(uint32_t stage, uint32_t phase, uint32_t skip_wait) {
+    detail::pipeline_check_is_consumer(params_.role);
+    if (skip_wait) {
+      return {BarrierStatus::WaitDone};
+    }
+    bool barrier_status = full_barrier_ptr_[stage].test_wait(phase);
+    return {static_cast<BarrierStatus>(barrier_status)};
+  }
+
+  CUTLASS_DEVICE
+  void consumer_wait(uint32_t stage, uint32_t phase) {
+    detail::pipeline_check_is_consumer(params_.role);
+    bool done = full_barrier_ptr_[stage].test_wait(phase);
+    if (!done) {
+      full_barrier_ptr_[stage].wait(phase);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void consumer_wait(uint32_t stage, uint32_t phase, ConsumerToken barrier_token) {
+    detail::pipeline_check_is_consumer(params_.role);
+    if (barrier_token == BarrierStatus::WaitAgain) {
+      full_barrier_ptr_[stage].wait(phase);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void consumer_release(uint32_t stage) {
+    detail::pipeline_check_is_consumer(params_.role);
+    empty_barrier_ptr_[stage].arrive(params_.dst_blockid);
+  }
 };
 ```
 [Source: `include/cutlass/pipeline/sm90_pipeline.hpp`](../include/cutlass/pipeline/sm90_pipeline.hpp)
